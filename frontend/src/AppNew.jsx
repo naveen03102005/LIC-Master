@@ -32,6 +32,7 @@ api.interceptors.response.use(
     if (error.response?.status === 401) {
       localStorage.removeItem('lic_token')
       localStorage.removeItem('lic_user')
+      localStorage.removeItem(CURRENT_POLICY_STORAGE_KEY)
       window.location.href = '/'
     }
     return Promise.reject(error)
@@ -59,16 +60,85 @@ adminApi.interceptors.response.use(
   }
 )
 
+/** All saved docs in one array; each entry MUST include `policyNumber`. */
+const MY_DOCUMENTS_STORAGE_KEY = 'lic_my_documents'
+const CURRENT_POLICY_STORAGE_KEY = 'lic_current_policy_number'
+
+function readAllStoredDocuments() {
+  try {
+    const raw = localStorage.getItem(MY_DOCUMENTS_STORAGE_KEY)
+    const arr = raw ? JSON.parse(raw) : []
+    return Array.isArray(arr) ? arr : []
+  } catch {
+    return []
+  }
+}
+
+function persistAllDocuments(all) {
+  localStorage.setItem(MY_DOCUMENTS_STORAGE_KEY, JSON.stringify(all))
+}
+
+function getDocumentsForPolicy(policyNumber) {
+  const p = String(policyNumber || '').trim()
+  if (!p) return []
+  return readAllStoredDocuments().filter((d) => String(d.policyNumber || '').trim() === p)
+}
+
+function appendDocumentsForPolicy(policyNumber, newEntries) {
+  const p = String(policyNumber || '').trim()
+  if (!p) return
+  const tagged = newEntries.map((doc) => ({ ...doc, policyNumber: p }))
+  persistAllDocuments([...readAllStoredDocuments(), ...tagged])
+}
+
+function removeDocumentByIdForPolicy(policyNumber, id) {
+  const p = String(policyNumber || '').trim()
+  const next = readAllStoredDocuments().filter(
+    (d) => !(String(d.policyNumber || '').trim() === p && d.id === id)
+  )
+  persistAllDocuments(next)
+}
+
+const ALLOWED_DOC_TYPES = /^(application\/pdf|image\/(jpeg|png))$/i
+
+function isAllowedMyDocumentFile(file) {
+  if (file?.type && ALLOWED_DOC_TYPES.test(file.type)) return true
+  return /\.(pdf|jpe?g|png)$/i.test(file?.name || '')
+}
+
+/** Build a File from a stored My Document (data URL). */
+function fileFromStoredDocument(doc) {
+  if (!doc?.data || !doc?.name) return null
+  try {
+    const arr = doc.data.split(',')
+    const mime = arr[0].match(/:(.*?);/)?.[1] || 'application/octet-stream'
+    const bstr = atob(arr[1])
+    const u8 = new Uint8Array(bstr.length)
+    for (let i = 0; i < bstr.length; i++) u8[i] = bstr.charCodeAt(i)
+    return new File([u8], doc.name, { type: mime })
+  } catch {
+    return null
+  }
+}
+
 function useAuth() {
   const [token, setToken] = useState(() => localStorage.getItem('lic_token'))
   const [user, setUser] = useState(() => {
     const raw = localStorage.getItem('lic_user')
-    return raw ? JSON.parse(raw) : null
+    if (!raw) return null
+    const u = JSON.parse(raw)
+    if (u?.policyNumber != null && String(u.policyNumber).trim() !== '') {
+      localStorage.setItem(CURRENT_POLICY_STORAGE_KEY, String(u.policyNumber).trim())
+    }
+    return u
   })
 
   const saveAuth = (newToken, newUser) => {
     localStorage.setItem('lic_token', newToken)
     localStorage.setItem('lic_user', JSON.stringify(newUser))
+    if (newUser?.policyNumber != null && String(newUser.policyNumber).trim() !== '') {
+      localStorage.setItem(CURRENT_POLICY_STORAGE_KEY, String(newUser.policyNumber).trim())
+    }
     setToken(newToken)
     setUser(newUser)
   }
@@ -76,6 +146,7 @@ function useAuth() {
   const logout = () => {
     localStorage.removeItem('lic_token')
     localStorage.removeItem('lic_user')
+    localStorage.removeItem(CURRENT_POLICY_STORAGE_KEY)
     setToken(null)
     setUser(null)
   }
@@ -90,6 +161,34 @@ function formatTime(iso) {
   } catch {
     return ''
   }
+}
+
+function normalizeClaimDocuments(claim) {
+  const list = claim?.documents || []
+  return list.map((d, i) => {
+    if (typeof d === 'string') {
+      return { originalName: d, canDownload: false }
+    }
+    const originalName = d?.originalName || `Document ${i + 1}`
+    const storedPath = d?.storedPath || ''
+    return { originalName, canDownload: Boolean(storedPath) }
+  })
+}
+
+function claimCategoryInfo(claimType) {
+  const map = {
+    Maturity: { label: 'Maturity', description: 'Maturity benefit — policy term completion' },
+    Death: { label: 'Death', description: 'Life claim — death benefit for nominees' },
+    Surrender: { label: 'Surrender', description: 'Surrender value — early policy closure' },
+    Health: { label: 'Health', description: 'Health / medical rider or hospitalization' },
+  }
+  const key = claimType || ''
+  return (
+    map[key] || {
+      label: key || 'General',
+      description: 'Insurance claim submission',
+    }
+  )
 }
 
 function MaterialIcon({ name, className = '' }) {
@@ -112,14 +211,27 @@ function UnifiedLoginPage({ initialMode = 'user', onUserLogin }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [info, setInfo] = useState('')
+  const [mobileFieldError, setMobileFieldError] = useState('')
+  const [policyFieldError, setPolicyFieldError] = useState('')
 
   // Admin login
   const [adminUser, setAdminUser] = useState('')
   const [adminPass, setAdminPass] = useState('')
 
   const requestOtp = async () => {
-    setLoading(true)
+    setMobileFieldError('')
+    setPolicyFieldError('')
     setError('')
+    const pErr = policyNumberFieldError(policyNumber, false)
+    if (pErr) {
+      setPolicyFieldError(pErr)
+      return
+    }
+    if (!PHONE_REGEX.test(mobileNumber)) {
+      setMobileFieldError('Invalid phone number')
+      return
+    }
+    setLoading(true)
     setInfo('')
     try {
       const { data } = await api.post('/auth/request-otp', { policyNumber, mobileNumber })
@@ -135,8 +247,19 @@ function UnifiedLoginPage({ initialMode = 'user', onUserLogin }) {
 
   /** New OTP from server — use after a wrong attempt or when user needs a fresh code */
   const resendOtp = async () => {
-    setLoading(true)
+    setMobileFieldError('')
+    setPolicyFieldError('')
     setError('')
+    const pErr = policyNumberFieldError(policyNumber, false)
+    if (pErr) {
+      setPolicyFieldError(pErr)
+      return
+    }
+    if (!PHONE_REGEX.test(mobileNumber)) {
+      setMobileFieldError('Invalid phone number')
+      return
+    }
+    setLoading(true)
     try {
       const { data } = await api.post('/auth/request-otp', { policyNumber, mobileNumber })
       setOtp('')
@@ -238,6 +361,8 @@ function UnifiedLoginPage({ initialMode = 'user', onUserLogin }) {
                       setMode('user')
                       setError('')
                       setInfo('')
+                      setMobileFieldError('')
+                      setPolicyFieldError('')
                     }}
                   >
                     <MaterialIcon name="person" className="!text-lg" />
@@ -253,6 +378,8 @@ function UnifiedLoginPage({ initialMode = 'user', onUserLogin }) {
                       setMode('admin')
                       setError('')
                       setInfo('')
+                      setMobileFieldError('')
+                      setPolicyFieldError('')
                     }}
                   >
                     <MaterialIcon name="admin_panel_settings" className="!text-lg" />
@@ -266,7 +393,7 @@ function UnifiedLoginPage({ initialMode = 'user', onUserLogin }) {
                   </h3>
                   <p className="text-slate-500 dark:text-slate-400 text-sm">
                     {mode === 'admin'
-                      ? 'Please sign in to manage claims and review chat logs.'
+                      ? 'Please sign in to manage claims.'
                       : 'Enter your policy details to manage your claims efficiently.'}
                   </p>
                 </div>
@@ -288,7 +415,14 @@ function UnifiedLoginPage({ initialMode = 'user', onUserLogin }) {
                 )}
 
                 {mode === 'user' ? (
-                  <div className="space-y-6">
+                  <form
+                    className="space-y-6"
+                    noValidate
+                    onSubmit={(e) => {
+                      e.preventDefault()
+                      if (!otpRequested) void requestOtp()
+                    }}
+                  >
                     <div>
                       <label className="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-2">
                         Policy Number
@@ -298,12 +432,35 @@ function UnifiedLoginPage({ initialMode = 'user', onUserLogin }) {
                           <MaterialIcon name="article" className="text-slate-400 !text-xl" />
                         </div>
                         <input
-                          className="block w-full pl-10 pr-4 py-3 border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-[#005299]/20 focus:border-[#005299] transition-all outline-none"
-                          placeholder="Enter policy number"
+                          className={`block w-full pl-10 pr-4 py-3 border rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 transition-all outline-none ${
+                            policyFieldError
+                              ? 'border-red-500 focus:ring-red-500/30 focus:border-red-500'
+                              : 'border-slate-200 dark:border-slate-700 focus:ring-[#005299]/20 focus:border-[#005299]'
+                          }`}
+                          placeholder="6–10 digit policy number"
+                          inputMode="numeric"
+                          autoComplete="off"
                           value={policyNumber}
-                          onChange={(e) => setPolicyNumber(e.target.value)}
+                          onChange={(e) => {
+                            const raw = e.target.value
+                            const hadNonDigit = /[^0-9]/.test(raw)
+                            const d = sanitizePolicyDigits(raw)
+                            setPolicyNumber(d)
+                            setPolicyFieldError(policyNumberFieldError(d, hadNonDigit))
+                          }}
+                          aria-invalid={policyFieldError ? true : undefined}
+                          aria-describedby="policyholder-policy-error"
                         />
                       </div>
+                      {policyFieldError && (
+                        <p
+                          id="policyholder-policy-error"
+                          className="mt-1.5 text-sm text-red-600 dark:text-red-400"
+                          role="alert"
+                        >
+                          {policyFieldError}
+                        </p>
+                      )}
                     </div>
 
                     <div>
@@ -315,12 +472,34 @@ function UnifiedLoginPage({ initialMode = 'user', onUserLogin }) {
                           <MaterialIcon name="call" className="text-slate-400 !text-xl" />
                         </div>
                         <input
-                          className="block w-full pl-10 pr-4 py-3 border border-slate-200 dark:border-slate-700 rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 focus:ring-[#005299]/20 focus:border-[#005299] transition-all outline-none"
-                          placeholder="Enter registered mobile number"
+                          className={`block w-full pl-10 pr-4 py-3 border rounded-lg bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:ring-2 transition-all outline-none ${
+                            mobileFieldError
+                              ? 'border-red-500 focus:ring-red-500/30 focus:border-red-500'
+                              : 'border-slate-200 dark:border-slate-700 focus:ring-[#005299]/20 focus:border-[#005299]'
+                          }`}
+                          placeholder="10-digit mobile number"
+                          inputMode="numeric"
+                          autoComplete="tel"
+                          maxLength={10}
                           value={mobileNumber}
-                          onChange={(e) => setMobileNumber(e.target.value)}
+                          onChange={(e) => {
+                            const v = sanitizePhoneDigits(e.target.value)
+                            setMobileNumber(v)
+                            setMobileFieldError(mobileValidationMessage(v))
+                          }}
+                          aria-invalid={mobileFieldError ? true : undefined}
+                          aria-describedby="policyholder-mobile-error"
                         />
                       </div>
+                      {mobileFieldError && (
+                        <p
+                          id="policyholder-mobile-error"
+                          className="mt-1.5 text-sm text-red-600 dark:text-red-400"
+                          role="alert"
+                        >
+                          {mobileFieldError}
+                        </p>
+                      )}
                     </div>
 
                     {otpRequested && (
@@ -352,8 +531,12 @@ function UnifiedLoginPage({ initialMode = 'user', onUserLogin }) {
 
                     {!otpRequested ? (
                       <button
-                        onClick={requestOtp}
-                        disabled={loading}
+                        type="submit"
+                        disabled={
+                          loading ||
+                          !POLICY_NUMBER_REGEX.test(policyNumber) ||
+                          !PHONE_REGEX.test(mobileNumber)
+                        }
                         className="w-full bg-[#005299] text-white font-bold py-3.5 rounded-lg flex items-center justify-center gap-2 hover:bg-[#005299]/90 transition-all shadow-lg disabled:opacity-60"
                       >
                         <MaterialIcon name="verified_user" className="!text-xl" />
@@ -383,7 +566,7 @@ function UnifiedLoginPage({ initialMode = 'user', onUserLogin }) {
                         </button>
                       </div>
                     )}
-                  </div>
+                  </form>
                 ) : (
                   <form className="space-y-6" onSubmit={adminLogin}>
                     <div>
@@ -538,11 +721,17 @@ function UserSidebar({ user, onLogout }) {
   )
 }
 
-function MyDocumentsModal({ isOpen, onClose, onSelect }) {
-  const [docs] = useState(() => {
-    const raw = localStorage.getItem('lic_my_documents')
-    return raw ? JSON.parse(raw) : []
-  })
+function MyDocumentsModal({ isOpen, onClose, onSelect, policyNumber }) {
+  const [docs, setDocs] = useState([])
+
+  useEffect(() => {
+    if (!isOpen) {
+      setDocs([])
+      return
+    }
+    const p = String(policyNumber || '').trim()
+    setDocs(p ? getDocumentsForPolicy(p) : [])
+  }, [isOpen, policyNumber])
 
   if (!isOpen) return null
 
@@ -581,7 +770,7 @@ function MyDocumentsModal({ isOpen, onClose, onSelect }) {
   )
 }
 
-function ChatbotAssistantPage() {
+function ChatbotAssistantPage({ user }) {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
@@ -619,17 +808,8 @@ function ChatbotAssistantPage() {
   }
 
   const handleSelectFromDocs = (doc) => {
-    // If the doc has data (Base64), convert it back to a File object or blob for FormData
-    if (doc.data) {
-      const arr = doc.data.split(',')
-      const mime = arr[0].match(/:(.*?);/)[1]
-      const bstr = atob(arr[1])
-      let n = bstr.length
-      const u8arr = new Uint8Array(n)
-      while (n--) u8arr[n] = bstr.charCodeAt(n)
-      const file = new File([u8arr], doc.name, { type: mime })
-      setAttachedFile(file)
-    }
+    const file = fileFromStoredDocument(doc)
+    if (file) setAttachedFile(file)
     setShowDocModal(false)
   }
 
@@ -842,48 +1022,119 @@ function ChatbotAssistantPage() {
           <p className="text-[10px] text-slate-400">Secure claim filing system</p>
         </div>
       </footer>
-      <MyDocumentsModal 
-        isOpen={showDocModal} 
+      <MyDocumentsModal
+        isOpen={showDocModal}
         onClose={() => setShowDocModal(false)}
         onSelect={handleSelectFromDocs}
+        policyNumber={user?.policyNumber}
       />
     </main>
   )
 }
 
-function calculateProgress(form, files) {
-  let score = 0
-  if (form.policyNumber) score += 20
-  if (form.policyholderName) score += 20
-  if (form.claimType) score += 20
-  if (form.reason) score += 20
-  if (files.length > 0) score += 20
-  return score
+/** Policy number: 6–10 digits, numeric only (trimmed). */
+const POLICY_NUMBER_REGEX = /^[0-9]{6,10}$/
+
+function sanitizePolicyDigits(value) {
+  return String(value).replace(/\D/g, '').slice(0, 10)
+}
+
+/**
+ * Real-time policy validation. `digits` = sanitized; `inputHadNonDigit` if raw input contained non-numeric chars.
+ */
+function policyNumberFieldError(digits, inputHadNonDigit) {
+  const t = String(digits).trim()
+  if (POLICY_NUMBER_REGEX.test(t)) return ''
+  if (t.length === 0) return 'Policy number is required'
+  if (inputHadNonDigit) return 'Policy number must contain only numbers'
+  if (t.length < 6) return 'Policy number must be at least 6 digits'
+  if (t.length > 10) return 'Policy number must not exceed 10 digits'
+  return ''
+}
+
+/** Policyholder login: registered mobile must be exactly 10 digits (0–9). */
+const PHONE_REGEX = /^[0-9]{10}$/
+
+function sanitizePhoneDigits(value) {
+  return String(value).replace(/\D/g, '').slice(0, 10)
+}
+
+function mobileValidationMessage(digits) {
+  if (digits.length === 0) return ''
+  return PHONE_REGEX.test(digits) ? '' : 'Invalid phone number'
+}
+
+/** New Claim — Step 2: four fields, 25% each (Policy #, Claim type, Name, Reason). */
+function getClaimDetailsProgressPercent(form) {
+  let filled = 0
+  if (POLICY_NUMBER_REGEX.test(String(form.policyNumber || '').trim())) filled += 1
+  if (form.claimType) filled += 1
+  if ((form.policyholderName || '').trim()) filled += 1
+  if ((form.reason || '').trim()) filled += 1
+  return filled * 25
+}
+
+function isClaimDetailsComplete(form) {
+  return getClaimDetailsProgressPercent(form) === 100
 }
 
 function ClaimSubmitPage({ user }) {
   const navigate = useNavigate()
-  const [form, setForm] = useState({
-    policyNumber: user?.policyNumber || '',
+  const [form, setForm] = useState(() => ({
+    policyNumber: sanitizePolicyDigits(user?.policyNumber || ''),
     policyholderName: '',
     claimType: '',
     reason: '',
-  })
+  }))
+  const [claimPolicyError, setClaimPolicyError] = useState(() =>
+    policyNumberFieldError(sanitizePolicyDigits(user?.policyNumber || ''), false)
+  )
   const [files, setFiles] = useState([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
+  const [showValidation, setShowValidation] = useState(false)
 
   const [showDocPicker, setShowDocPicker] = useState(false)
-  const [myDocs] = useState(() => {
-    const raw = localStorage.getItem('lic_my_documents')
-    return raw ? JSON.parse(raw) : []
-  })
+  const [docPickerDocs, setDocPickerDocs] = useState([])
 
   const fileInputRef = useRef(null)
 
+  const claimPolicyKey = String(user?.policyNumber || '').trim()
+
+  useEffect(() => {
+    if (!showDocPicker) {
+      setDocPickerDocs([])
+      return
+    }
+    setDocPickerDocs(claimPolicyKey ? getDocumentsForPolicy(claimPolicyKey) : [])
+  }, [showDocPicker, claimPolicyKey])
+
+  const progressPercent = useMemo(() => getClaimDetailsProgressPercent(form), [form])
+  const detailsComplete = progressPercent === 100
+
+  useEffect(() => {
+    if (detailsComplete && showValidation) setShowValidation(false)
+  }, [detailsComplete, showValidation])
+
+  const invalidPolicy = Boolean(claimPolicyError)
+  const invalidClaimType = showValidation && !form.claimType
+  const invalidName = showValidation && !form.policyholderName.trim()
+  const invalidReason = showValidation && !form.reason.trim()
+
+  const fieldBorderClass = (invalid) =>
+    invalid
+      ? 'border-red-500 dark:border-red-500 focus:border-red-500 focus:ring-2 focus:ring-red-500/30 ring-1 ring-red-500/40'
+      : 'border-slate-300 dark:border-slate-700 focus:border-[#005299] focus:ring-2 focus:ring-[#005299]/20'
+
   const submit = async (e) => {
     e.preventDefault()
+    if (!isClaimDetailsComplete(form)) {
+      setShowValidation(true)
+      setClaimPolicyError(policyNumberFieldError(form.policyNumber, false))
+      return
+    }
+    setShowValidation(false)
     setLoading(true)
     setError('')
     setSuccess('')
@@ -949,16 +1200,16 @@ function ClaimSubmitPage({ user }) {
               <div className="flex flex-col gap-3">
                 <div className="flex gap-6 justify-between items-end">
                   <span className="text-[#005299] font-semibold text-sm">
-                    Step {calculateProgress(form, files) < 100 ? '2 of 4: Claim Details' : 'Final Step: Ready to Submit'}
+                    Step {progressPercent < 100 ? '2 of 4: Claim Details' : 'Final Step: Ready to Submit'}
                   </span>
                   <span className="text-slate-500 dark:text-slate-400 text-sm font-medium">
-                    {calculateProgress(form, files)}% Complete
+                    {progressPercent}% Complete
                   </span>
                 </div>
                 <div className="h-2 w-full rounded-full bg-[#005299]/10 overflow-hidden">
-                  <div 
-                    className="h-full bg-[#005299] rounded-full transition-all duration-500" 
-                    style={{ width: `${calculateProgress(form, files)}%` }}
+                  <div
+                    className="claim-progress-bar-fill h-full bg-[#005299] rounded-full"
+                    style={{ width: `${progressPercent}%` }}
                   />
                 </div>
               </div>
@@ -975,7 +1226,11 @@ function ClaimSubmitPage({ user }) {
               </div>
             )}
 
-            <form onSubmit={submit} className="space-y-8 bg-white dark:bg-slate-900 p-6 md:p-10 rounded-xl shadow-sm border border-[#005299]/5">
+            <form
+              onSubmit={submit}
+              noValidate
+              className="space-y-8 bg-white dark:bg-slate-900 p-6 md:p-10 rounded-xl shadow-sm border border-[#005299]/5"
+            >
               <section className="space-y-6">
                 <div className="flex items-center gap-2 pb-2 border-b border-[#005299]/10">
                   <MaterialIcon name="description" className="text-[#005299]" />
@@ -987,24 +1242,41 @@ function ClaimSubmitPage({ user }) {
                       Policy Number
                     </label>
                     <input
-                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent focus:border-[#005299] focus:ring-2 focus:ring-[#005299]/20 h-11 px-4 text-sm"
-                      placeholder="e.g. 123456789"
+                      className={`rounded-lg border bg-transparent h-11 px-4 text-sm ${fieldBorderClass(invalidPolicy)}`}
+                      placeholder="6–10 digit policy number"
+                      inputMode="numeric"
                       value={form.policyNumber}
-                      onChange={(e) => setForm((p) => ({ ...p, policyNumber: e.target.value }))}
-                      required
+                      onChange={(e) => {
+                        const raw = e.target.value
+                        const hadNonDigit = /[^0-9]/.test(raw)
+                        const d = sanitizePolicyDigits(raw)
+                        setForm((p) => ({ ...p, policyNumber: d }))
+                        setClaimPolicyError(policyNumberFieldError(d, hadNonDigit))
+                      }}
                       type="text"
+                      aria-invalid={invalidPolicy ? true : undefined}
+                      aria-describedby="claim-policy-error"
                     />
-                    <p className="text-[11px] text-slate-500">Enter the number from your policy bond.</p>
+                    {claimPolicyError ? (
+                      <p
+                        id="claim-policy-error"
+                        className="text-sm text-red-600 dark:text-red-400"
+                        role="alert"
+                      >
+                        {claimPolicyError}
+                      </p>
+                    ) : (
+                      <p className="text-[11px] text-slate-500">Enter the number from your policy bond.</p>
+                    )}
                   </div>
                   <div className="flex flex-col gap-2">
                     <label className="text-sm font-semibold text-slate-700 dark:text-slate-300">
                       Claim Type
                     </label>
                     <select
-                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent focus:border-[#005299] focus:ring-2 focus:ring-[#005299]/20 h-11 px-4 text-sm"
+                      className={`rounded-lg border bg-transparent h-11 px-4 text-sm ${fieldBorderClass(invalidClaimType)}`}
                       value={form.claimType}
                       onChange={(e) => setForm((p) => ({ ...p, claimType: e.target.value }))}
-                      required
                     >
                       <option value="">Select Claim Type</option>
                       <option value="Maturity">Maturity Claim</option>
@@ -1018,11 +1290,10 @@ function ClaimSubmitPage({ user }) {
                       Policyholder Name
                     </label>
                     <input
-                      className="rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent focus:border-[#005299] focus:ring-2 focus:ring-[#005299]/20 h-11 px-4 text-sm"
+                      className={`rounded-lg border bg-transparent h-11 px-4 text-sm ${fieldBorderClass(invalidName)}`}
                       placeholder="Full name as per policy"
                       value={form.policyholderName}
                       onChange={(e) => setForm((p) => ({ ...p, policyholderName: e.target.value }))}
-                      required
                       type="text"
                     />
                   </div>
@@ -1039,11 +1310,10 @@ function ClaimSubmitPage({ user }) {
                     Reason / Description
                   </label>
                   <textarea
-                    className="rounded-lg border border-slate-300 dark:border-slate-700 bg-transparent focus:border-[#005299] focus:ring-2 focus:ring-[#005299]/20 px-4 py-3 text-sm min-h-[110px]"
+                    className={`rounded-lg border bg-transparent px-4 py-3 text-sm min-h-[110px] ${fieldBorderClass(invalidReason)}`}
                     placeholder="Describe the reason for the claim..."
                     value={form.reason}
                     onChange={(e) => setForm((p) => ({ ...p, reason: e.target.value }))}
-                    required
                   />
                 </div>
               </section>
@@ -1098,19 +1368,20 @@ function ClaimSubmitPage({ user }) {
                         </button>
                       </div>
                       <div className="p-4 overflow-y-auto flex-1 space-y-2">
-                        {myDocs.length === 0 ? (
+                        {docPickerDocs.length === 0 ? (
                           <p className="text-center py-8 text-slate-500 text-sm">No documents found in My Documents.</p>
                         ) : (
-                          myDocs.map((d) => {
-                            const selected = files.some(f => f.name === d.name);
+                          docPickerDocs.map((d) => {
+                            const selected = files.some((f) => f.name === d.name)
                             return (
                               <div 
                                 key={d.id} 
                                 onClick={() => {
                                   if (selected) {
-                                    setFiles(prev => prev.filter(f => f.name !== d.name));
+                                    setFiles((prev) => prev.filter((f) => f.name !== d.name))
                                   } else {
-                                    setFiles(prev => [...prev, { name: d.name, size: parseFloat(d.size) * 1024 * 1024, fromSaved: true }]);
+                                    const file = fileFromStoredDocument(d)
+                                    if (file) setFiles((prev) => [...prev, file])
                                   }
                                 }}
                                 className={`flex items-center justify-between p-3 rounded-xl border transition-all cursor-pointer ${
@@ -1185,7 +1456,8 @@ function ClaimSubmitPage({ user }) {
                   <button
                     className="w-full sm:w-auto px-10 h-12 rounded-lg bg-[#005299] text-white font-bold shadow-lg hover:brightness-110 transition-all flex items-center justify-center gap-2 disabled:opacity-60"
                     type="submit"
-                    disabled={loading}
+                    title={!detailsComplete ? 'Complete all claim detail fields to submit' : undefined}
+                    disabled={loading || !detailsComplete}
                   >
                     {loading ? 'Submitting...' : 'Submit Claim'}
                     <MaterialIcon name="arrow_forward" className="text-lg" />
@@ -1320,43 +1592,72 @@ function ClaimStatusPage() {
   )
 }
 
-function MyDocumentsPage() {
-  const [docs, setDocs] = useState(() => {
-    const raw = localStorage.getItem('lic_my_documents')
-    return raw ? JSON.parse(raw) : []
-  })
+function MyDocumentsPage({ user }) {
+  const policy = String(user?.policyNumber || '').trim()
+  const [docs, setDocs] = useState(() => getDocumentsForPolicy(policy))
+  const [uploadNotice, setUploadNotice] = useState('')
+  const [uploadError, setUploadError] = useState('')
   const fileRef = useRef(null)
 
+  useEffect(() => {
+    setDocs(policy ? getDocumentsForPolicy(policy) : [])
+    setUploadNotice('')
+    setUploadError('')
+  }, [policy])
+
+  const refreshDocs = () => setDocs(policy ? getDocumentsForPolicy(policy) : [])
+
   const upload = async (e) => {
-    const files = e.target.files
-    if (!files || files.length === 0) return
+    const fileList = e.target.files
+    if (!fileList || fileList.length === 0) return
+    setUploadError('')
+    setUploadNotice('')
 
-    const results = await Promise.all(Array.from(files).map(f => {
-      return new Promise((resolve) => {
-        const reader = new FileReader()
-        reader.onload = (ev) => {
-          resolve({
-            name: f.name,
-            size: (f.size / 1024 / 1024).toFixed(2) + ' MB',
-            date: new Date().toISOString(),
-            id: Math.random().toString(36).substr(2, 9),
-            type: f.type,
-            data: ev.target.result // Base64
+    if (!policy) {
+      setUploadError('You must be logged in with a policy number to save documents.')
+      e.target.value = ''
+      return
+    }
+
+    const accepted = Array.from(fileList).filter((f) => isAllowedMyDocumentFile(f))
+    const rejected = Array.from(fileList).length - accepted.length
+    if (accepted.length === 0) {
+      setUploadError('Only PDF, JPG, and PNG files are allowed.')
+      e.target.value = ''
+      return
+    }
+
+    const results = await Promise.all(
+      accepted.map(
+        (f) =>
+          new Promise((resolve) => {
+            const reader = new FileReader()
+            reader.onload = (ev) => {
+              resolve({
+                name: f.name,
+                size: (f.size / 1024 / 1024).toFixed(2) + ' MB',
+                date: new Date().toISOString(),
+                id: `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+                type: f.type,
+                data: ev.target.result,
+              })
+            }
+            reader.readAsDataURL(f)
           })
-        }
-        reader.readAsDataURL(f)
-      })
-    }))
+      )
+    )
 
-    const updated = [...docs, ...results]
-    setDocs(updated)
-    localStorage.setItem('lic_my_documents', JSON.stringify(updated))
+    appendDocumentsForPolicy(policy, results)
+    refreshDocs()
+    e.target.value = ''
+    const msg = `${results.length} file(s) saved for policy ${policy}.`
+    setUploadNotice(rejected > 0 ? `${msg} (${rejected} skipped — invalid type.)` : msg)
   }
 
   const deleteDoc = (id) => {
-    const updated = docs.filter((d) => d.id !== id)
-    setDocs(updated)
-    localStorage.setItem('lic_my_documents', JSON.stringify(updated))
+    if (!policy) return
+    removeDocumentByIdForPolicy(policy, id)
+    refreshDocs()
   }
 
   return (
@@ -1376,8 +1677,31 @@ function MyDocumentsPage() {
             <MaterialIcon name="add" />
             Add Document
           </button>
-          <input type="file" ref={fileRef} className="hidden" multiple onChange={upload} />
+          <input
+            type="file"
+            ref={fileRef}
+            className="hidden"
+            multiple
+            accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png"
+            onChange={upload}
+          />
         </div>
+
+        {!policy && (
+          <p className="mb-4 text-sm text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 px-3 py-2 rounded-lg">
+            Sign in with your policy number to view and upload documents.
+          </p>
+        )}
+        {uploadError && (
+          <p className="mb-4 text-sm text-red-600 dark:text-red-400" role="alert">
+            {uploadError}
+          </p>
+        )}
+        {uploadNotice && (
+          <p className="mb-4 text-sm text-emerald-700 dark:text-emerald-300 bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 px-3 py-2 rounded-lg">
+            {uploadNotice}
+          </p>
+        )}
 
         <div className="grid gap-4">
           {docs.map((d) => (
@@ -1476,9 +1800,9 @@ function UserShell({ user, onLogout }) {
       <div className="relative flex h-screen w-full overflow-hidden">
         <UserSidebar user={user} onLogout={onLogout} />
         <Routes>
-          <Route path="/chat" element={<ChatbotAssistantPage />} />
+          <Route path="/chat" element={<ChatbotAssistantPage user={user} />} />
           <Route path="/claims/status" element={<ClaimStatusPage />} />
-          <Route path="/documents" element={<MyDocumentsPage />} />
+          <Route path="/documents" element={<MyDocumentsPage user={user} />} />
           <Route path="/support" element={<CustomerSupportPage />} />
           <Route path="*" element={<Navigate to="/chat" replace />} />
         </Routes>
@@ -1518,13 +1842,6 @@ function AdminLayout({ children }) {
               <MaterialIcon name="dashboard" />
               <span className="text-sm font-medium">Dashboard</span>
             </Link>
-            <Link
-              className="flex items-center gap-3 px-3 py-2 rounded-lg text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
-              to="/admin/chatlogs"
-            >
-              <MaterialIcon name="chat" />
-              <span className="text-sm font-medium">Chat Logs</span>
-            </Link>
             <button
               className="w-full flex items-center gap-3 px-3 py-2 rounded-lg text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
               onClick={() => {
@@ -1552,6 +1869,39 @@ function AdminDashboardPage() {
   const [claims, setClaims] = useState([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [detailClaim, setDetailClaim] = useState(null)
+
+  const downloadClaimDocument = async (claimId, fileIndex, originalName) => {
+    setError('')
+    try {
+      const res = await adminApi.get(`/admin/claims/${claimId}/files/${fileIndex}`, {
+        responseType: 'blob',
+      })
+      const url = URL.createObjectURL(res.data)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = originalName || 'document'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      let msg = 'Could not download file'
+      const data = e.response?.data
+      if (data instanceof Blob) {
+        try {
+          const text = await data.text()
+          const j = JSON.parse(text)
+          if (j.message) msg = j.message
+        } catch {
+          /* ignore */
+        }
+      } else if (e.response?.data?.message) {
+        msg = e.response.data.message
+      }
+      setError(msg)
+    }
+  }
 
   const load = async () => {
     setLoading(true)
@@ -1688,8 +2038,14 @@ function AdminDashboardPage() {
                     <td className="px-6 py-4 text-sm font-medium text-[#005299]">
                       #{c._id.slice(-6)}
                     </td>
-                    <td className="px-6 py-4 text-sm text-slate-600 dark:text-slate-400">
-                      {c.policyNumber}
+                    <td className="px-6 py-4 text-sm">
+                      <button
+                        type="button"
+                        onClick={() => setDetailClaim(c)}
+                        className="text-[#005299] dark:text-sky-400 font-medium hover:underline text-left"
+                      >
+                        {c.policyNumber}
+                      </button>
                     </td>
                     <td className="px-6 py-4 text-sm font-medium">
                       {c.policyholderName || '—'}
@@ -1739,84 +2095,136 @@ function AdminDashboardPage() {
           </div>
         </div>
       </div>
-    </>
-  )
-}
 
-function AdminChatLogsPage() {
-  const [logs, setLogs] = useState([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-
-  const load = async () => {
-    setLoading(true)
-    setError('')
-    try {
-      const { data } = await adminApi.get('/admin/chatlogs')
-      setLogs(data)
-    } catch (e) {
-      setError(e.response?.data?.message || e.message)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    load()
-  }, [])
-
-  return (
-    <>
-      <header className="h-16 border-b border-slate-200 dark:border-slate-800 bg-white/80 dark:bg-slate-900/80 backdrop-blur-md flex items-center justify-between px-8 sticky top-0 z-10">
-        <h2 className="text-xl font-bold">Chat Logs</h2>
-        <div className="flex items-center gap-3">
-          <button
-            className="px-3 py-2 bg-slate-100 dark:bg-slate-800 rounded-lg text-sm font-medium"
-            onClick={load}
-            disabled={loading}
+      {detailClaim && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="claim-detail-title"
+          onClick={() => setDetailClaim(null)}
+        >
+          <div
+            className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 shadow-2xl max-w-lg w-full max-h-[90vh] overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
           >
-            {loading ? 'Refreshing...' : 'Refresh'}
-          </button>
-        </div>
-      </header>
-      <div className="p-8 max-w-5xl mx-auto w-full space-y-4">
-        {error && (
-          <div className="text-sm text-red-600 bg-red-50 dark:bg-red-900/20 dark:text-red-300 border border-red-200 dark:border-red-800 px-3 py-2 rounded-lg">
-            {error}
-          </div>
-        )}
-        <div className="bg-white dark:bg-slate-900 rounded-xl border border-slate-200 dark:border-slate-800 shadow-sm overflow-hidden">
-          <div className="p-6 border-b border-slate-200 dark:border-slate-800">
-            <h3 className="text-lg font-bold">Recent Conversations</h3>
-            <p className="text-sm text-slate-500">Latest 200 messages.</p>
-          </div>
-          <div className="divide-y divide-slate-200 dark:divide-slate-800 max-h-[70vh] overflow-auto">
-            {logs.map((m) => (
-              <div key={m._id} className="px-6 py-4 flex items-start gap-3">
-                <span
-                  className={`px-2.5 py-1 rounded-full text-xs font-semibold ${m.sender === 'user'
-                      ? 'bg-[#005299]/10 text-[#005299]'
-                      : 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'
-                    }`}
-                >
-                  {m.sender === 'user' ? 'User' : 'Bot'}
-                </span>
-                <div className="flex-1">
-                  <p className="text-sm">{m.message}</p>
-                  <p className="text-[11px] text-slate-400 mt-1">
-                    {new Date(m.createdAt).toLocaleString()} • userId: {m.userId}
+            <div className="p-6 border-b border-slate-200 dark:border-slate-800 flex justify-between items-start gap-4">
+              <div>
+                <h3 id="claim-detail-title" className="text-lg font-bold text-slate-900 dark:text-white">
+                  Claim details
+                </h3>
+                <p className="text-xs text-slate-500 mt-1 font-mono">ID #{detailClaim._id.slice(-6)}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDetailClaim(null)}
+                className="p-2 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-600 dark:text-slate-300"
+                aria-label="Close"
+              >
+                <MaterialIcon name="close" />
+              </button>
+            </div>
+            <div className="p-6 space-y-5 text-sm text-slate-700 dark:text-slate-200">
+              <div className="grid grid-cols-1 gap-3">
+                <div>
+                  <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Policy number</p>
+                  <p className="font-medium text-slate-900 dark:text-white">{detailClaim.policyNumber}</p>
+                </div>
+                <div>
+                  <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Claimant</p>
+                  <p className="font-medium text-slate-900 dark:text-white">
+                    {detailClaim.policyholderName || '—'}
                   </p>
                 </div>
+                <div className="rounded-lg border border-[#005299]/20 bg-[#005299]/5 dark:bg-[#005299]/10 p-4">
+                  <p className="text-xs font-semibold text-[#005299] uppercase tracking-wide mb-1">
+                    Insurance category
+                  </p>
+                  <p className="text-base font-bold text-slate-900 dark:text-white">
+                    {detailClaim.claimType} claim
+                  </p>
+                  <p className="text-xs text-slate-600 dark:text-slate-400 mt-1">
+                    {claimCategoryInfo(detailClaim.claimType).description}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Reason / description</p>
+                  <p className="mt-1 text-slate-800 dark:text-slate-200 whitespace-pre-wrap">{detailClaim.reason}</p>
+                </div>
+                <div className="flex flex-wrap gap-4">
+                  <div>
+                    <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Status</p>
+                    <p className="mt-1 font-semibold">{detailClaim.status}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Submitted</p>
+                    <p className="mt-1">{new Date(detailClaim.createdAt).toLocaleString()}</p>
+                  </div>
+                </div>
               </div>
-            ))}
-            {logs.length === 0 && (
-              <div className="px-6 py-10 text-center text-sm text-slate-500">
-                No chat logs yet.
+
+              <div>
+                <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">
+                  Uploaded documents
+                </p>
+                {normalizeClaimDocuments(detailClaim).length === 0 ? (
+                  <p className="text-slate-500 text-xs">No documents were uploaded with this claim.</p>
+                ) : (
+                  <ul className="space-y-2">
+                    {normalizeClaimDocuments(detailClaim).map((doc, idx) => (
+                      <li
+                        key={`${detailClaim._id}-doc-${idx}`}
+                        className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-2"
+                      >
+                        <span className="truncate text-xs font-medium" title={doc.originalName}>
+                          {doc.originalName}
+                        </span>
+                        {doc.canDownload ? (
+                          <button
+                            type="button"
+                            onClick={() => downloadClaimDocument(detailClaim._id, idx, doc.originalName)}
+                            className="shrink-0 inline-flex items-center gap-1 rounded-md bg-[#005299] text-white text-xs font-semibold px-2.5 py-1.5 hover:bg-[#005299]/90"
+                          >
+                            <MaterialIcon name="download" className="!text-base" />
+                            Download
+                          </button>
+                        ) : (
+                          <span className="shrink-0 text-[11px] text-slate-400">Demo name only</span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
               </div>
-            )}
+
+              <div className="flex flex-wrap gap-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => {
+                    updateStatus(detailClaim._id, 'Approved')
+                    setDetailClaim(null)
+                  }}
+                  className="inline-flex items-center gap-1 rounded-lg bg-emerald-600 text-white text-xs font-semibold px-3 py-2 hover:bg-emerald-500"
+                >
+                  <MaterialIcon name="check_circle" className="!text-base" />
+                  Approve
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    updateStatus(detailClaim._id, 'Rejected')
+                    setDetailClaim(null)
+                  }}
+                  className="inline-flex items-center gap-1 rounded-lg bg-red-600 text-white text-xs font-semibold px-3 py-2 hover:bg-red-500"
+                >
+                  <MaterialIcon name="cancel" className="!text-base" />
+                  Reject
+                </button>
+              </div>
+            </div>
           </div>
         </div>
-      </div>
+      )}
     </>
   )
 }
@@ -1850,16 +2258,6 @@ function AppRouter() {
           <RequireAdmin>
             <AdminLayout>
               <AdminDashboardPage />
-            </AdminLayout>
-          </RequireAdmin>
-        }
-      />
-      <Route
-        path="/admin/chatlogs"
-        element={
-          <RequireAdmin>
-            <AdminLayout>
-              <AdminChatLogsPage />
             </AdminLayout>
           </RequireAdmin>
         }

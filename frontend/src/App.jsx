@@ -54,6 +54,44 @@ adminApi.interceptors.request.use((config) => {
   return config
 })
 
+function normalizeClaimDocuments(claim) {
+  const list = claim?.documents || []
+  return list.map((d, i) => {
+    if (typeof d === 'string') {
+      return { originalName: d, canDownload: false }
+    }
+    const originalName = d?.originalName || `Document ${i + 1}`
+    const storedPath = d?.storedPath || ''
+    return { originalName, canDownload: Boolean(storedPath) }
+  })
+}
+
+function claimCategoryInfo(claimType) {
+  const map = {
+    Maturity: { description: 'Maturity benefit — policy term completion' },
+    Death: { description: 'Life claim — death benefit for nominees' },
+    Surrender: { description: 'Surrender value — early policy closure' },
+    Health: { description: 'Health / medical rider or hospitalization' },
+  }
+  return map[claimType || ''] || { description: 'Insurance claim submission' }
+}
+
+const POLICY_NUMBER_REGEX = /^[0-9]{6,10}$/
+
+function sanitizePolicyDigits(value) {
+  return String(value).replace(/\D/g, '').slice(0, 10)
+}
+
+function policyNumberFieldError(digits, inputHadNonDigit) {
+  const t = String(digits).trim()
+  if (POLICY_NUMBER_REGEX.test(t)) return ''
+  if (t.length === 0) return 'Policy number is required'
+  if (inputHadNonDigit) return 'Policy number must contain only numbers'
+  if (t.length < 6) return 'Policy number must be at least 6 digits'
+  if (t.length > 10) return 'Policy number must not exceed 10 digits'
+  return ''
+}
+
 function LoginPage({ onLogin }) {
   const [policyNumber, setPolicyNumber] = useState('')
   const [mobileNumber, setMobileNumber] = useState('')
@@ -62,10 +100,17 @@ function LoginPage({ onLogin }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [info, setInfo] = useState('')
+  const [policyFieldError, setPolicyFieldError] = useState('')
 
   const requestOtp = async () => {
-    setLoading(true)
+    setPolicyFieldError('')
     setError('')
+    const pErr = policyNumberFieldError(policyNumber, false)
+    if (pErr) {
+      setPolicyFieldError(pErr)
+      return
+    }
+    setLoading(true)
     setInfo('')
     try {
       const { data } = await api.post('/auth/request-otp', {
@@ -83,8 +128,14 @@ function LoginPage({ onLogin }) {
   }
 
   const resendOtp = async () => {
-    setLoading(true)
+    setPolicyFieldError('')
     setError('')
+    const pErr = policyNumberFieldError(policyNumber, false)
+    if (pErr) {
+      setPolicyFieldError(pErr)
+      return
+    }
+    setLoading(true)
     try {
       const { data } = await api.post('/auth/request-otp', {
         policyNumber,
@@ -149,10 +200,28 @@ function LoginPage({ onLogin }) {
               Policy Number
             </label>
             <input
-              className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-amber-400 focus:border-amber-400"
+              className={`w-full rounded-md border bg-slate-900 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 ${
+                policyFieldError
+                  ? 'border-red-500 focus:ring-red-500 focus:border-red-500'
+                  : 'border-slate-700 focus:ring-amber-400 focus:border-amber-400'
+              }`}
+              placeholder="6–10 digits"
+              inputMode="numeric"
               value={policyNumber}
-              onChange={(e) => setPolicyNumber(e.target.value)}
+              onChange={(e) => {
+                const raw = e.target.value
+                const hadNonDigit = /[^0-9]/.test(raw)
+                const d = sanitizePolicyDigits(raw)
+                setPolicyNumber(d)
+                setPolicyFieldError(policyNumberFieldError(d, hadNonDigit))
+              }}
+              aria-invalid={policyFieldError ? true : undefined}
             />
+            {policyFieldError && (
+              <p className="mt-1.5 text-sm text-red-400" role="alert">
+                {policyFieldError}
+              </p>
+            )}
           </div>
           <div>
             <label className="block text-sm mb-1 text-slate-300">
@@ -189,7 +258,7 @@ function LoginPage({ onLogin }) {
           {!otpRequested ? (
             <button
               onClick={requestOtp}
-              disabled={loading}
+              disabled={loading || !POLICY_NUMBER_REGEX.test(policyNumber)}
               className="w-full inline-flex justify-center items-center rounded-md bg-amber-500 hover:bg-amber-400 text-slate-900 text-sm font-medium px-4 py-2 disabled:opacity-60"
             >
               {loading ? 'Requesting OTP...' : 'Request OTP'}
@@ -406,6 +475,9 @@ function NewClaim() {
     claimType: '',
     reason: '',
   })
+  const [newClaimPolicyError, setNewClaimPolicyError] = useState(() =>
+    policyNumberFieldError('', false)
+  )
   const [documents, setDocuments] = useState(null)
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
@@ -415,17 +487,31 @@ function NewClaim() {
     const rawUser = localStorage.getItem('lic_user')
     if (rawUser) {
       const u = JSON.parse(rawUser)
-      setForm((f) => ({ ...f, policyNumber: u.policyNumber }))
+      const d = sanitizePolicyDigits(u.policyNumber || '')
+      setForm((f) => ({ ...f, policyNumber: d }))
+      setNewClaimPolicyError(policyNumberFieldError(d, false))
     }
   }, [])
 
   const handleChange = (e) => {
     const { name, value } = e.target
+    if (name === 'policyNumber') {
+      const hadNonDigit = /[^0-9]/.test(value)
+      const d = sanitizePolicyDigits(value)
+      setForm((prev) => ({ ...prev, policyNumber: d }))
+      setNewClaimPolicyError(policyNumberFieldError(d, hadNonDigit))
+      return
+    }
     setForm((prev) => ({ ...prev, [name]: value }))
   }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
+    const pErr = policyNumberFieldError(form.policyNumber, false)
+    if (pErr) {
+      setNewClaimPolicyError(pErr)
+      return
+    }
     setLoading(true)
     setError('')
     setMessage('')
@@ -473,10 +559,21 @@ function NewClaim() {
             </label>
             <input
               name="policyNumber"
-              className="w-full rounded-md border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 focus:ring-amber-400 focus:border-amber-400"
+              className={`w-full rounded-md border bg-slate-900 px-3 py-2 text-sm text-slate-100 outline-none focus:ring-2 ${
+                newClaimPolicyError
+                  ? 'border-red-500 focus:ring-red-500 focus:border-red-500'
+                  : 'border-slate-700 focus:ring-amber-400 focus:border-amber-400'
+              }`}
+              placeholder="6–10 digits"
+              inputMode="numeric"
               value={form.policyNumber}
               onChange={handleChange}
             />
+            {newClaimPolicyError && (
+              <p className="mt-1.5 text-sm text-red-400" role="alert">
+                {newClaimPolicyError}
+              </p>
+            )}
           </div>
           <div>
             <label className="block text-sm mb-1 text-slate-300">
@@ -532,7 +629,7 @@ function NewClaim() {
         </div>
         <button
           type="submit"
-          disabled={loading}
+          disabled={loading || !POLICY_NUMBER_REGEX.test(form.policyNumber)}
           className="inline-flex items-center justify-center rounded-md bg-amber-500 hover:bg-amber-400 text-slate-900 text-sm font-medium px-4 py-2 disabled:opacity-60"
         >
           {loading ? 'Submitting...' : 'Submit Claim'}
@@ -672,7 +769,7 @@ function AdminLogin() {
         <div className="text-center space-y-2">
           <h1 className="text-2xl font-semibold tracking-tight">LIC Admin Console</h1>
           <p className="text-xs text-slate-400">
-            Sign in to review claims and chatbot activity.
+            Sign in to review and manage claims.
           </p>
         </div>
         {error && (
@@ -736,15 +833,12 @@ function AdminShell() {
             </div>
             <div>
               <p className="text-sm font-semibold">LIC Admin Dashboard</p>
-              <p className="text-[11px] text-slate-400">Claims & chatbot monitoring</p>
+              <p className="text-[11px] text-slate-400">Claims management</p>
             </div>
           </div>
           <nav className="flex items-center gap-4 text-xs md:text-sm">
             <Link className="text-slate-300 hover:text-amber-400" to="/admin/dashboard">
               Claims
-            </Link>
-            <Link className="text-slate-300 hover:text-amber-400" to="/admin/chatlogs">
-              Chat Logs
             </Link>
             <button
               onClick={logout}
@@ -759,7 +853,6 @@ function AdminShell() {
         <div className="max-w-6xl mx-auto px-4 py-6 space-y-4">
           <Routes>
             <Route path="/dashboard" element={<AdminDashboard />} />
-            <Route path="/chatlogs" element={<AdminChatLogs />} />
             <Route path="*" element={<Navigate to="/admin/dashboard" replace />} />
           </Routes>
         </div>
@@ -814,6 +907,38 @@ function AdminDashboard() {
     }
   }
 
+  const downloadClaimDocument = async (claimId, fileIndex, originalName) => {
+    setError('')
+    try {
+      const res = await adminApi.get(`/admin/claims/${claimId}/files/${fileIndex}`, {
+        responseType: 'blob',
+      })
+      const url = URL.createObjectURL(res.data)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = originalName || 'document'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      let msg = 'Could not download file'
+      const data = err.response?.data
+      if (data instanceof Blob) {
+        try {
+          const text = await data.text()
+          const j = JSON.parse(text)
+          if (j.message) msg = j.message
+        } catch {
+          /* ignore */
+        }
+      } else if (err.response?.data?.message) {
+        msg = err.response.data.message
+      }
+      setError(msg)
+    }
+  }
+
   return (
     <div className="space-y-4">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
@@ -853,8 +978,8 @@ function AdminDashboard() {
                 <div className="space-y-1">
                   <p className="text-sm font-medium">
                     {c.claimType} •{' '}
-                    <span className="text-xs text-slate-400">
-                      Policy #{c.policyNumber}
+                    <span className="text-xs text-amber-300/90 font-semibold">
+                      Policy {c.policyNumber}
                     </span>
                   </p>
                   <p className="text-xs text-slate-400 line-clamp-2">{c.reason}</p>
@@ -887,11 +1012,47 @@ function AdminDashboard() {
           {selected ? (
             <div className="space-y-3 text-sm">
               <div className="text-xs text-slate-400">
-                <p>Policy #{selected.policyNumber}</p>
+                <p className="text-slate-200 font-medium">Policy {selected.policyNumber}</p>
                 <p>ID: {selected._id}</p>
               </div>
-              <p className="font-medium">{selected.claimType}</p>
-              <p className="text-xs text-slate-300">{selected.reason}</p>
+              <div className="rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2">
+                <p className="text-[10px] uppercase tracking-wide text-amber-200/80">Insurance category</p>
+                <p className="font-semibold text-amber-100">{selected.claimType} claim</p>
+                <p className="text-[11px] text-slate-400 mt-1">
+                  {claimCategoryInfo(selected.claimType).description}
+                </p>
+              </div>
+              <p className="text-xs text-slate-300 whitespace-pre-wrap">{selected.reason}</p>
+              <div className="space-y-2 pt-2 border-t border-slate-800">
+                <p className="text-[10px] uppercase tracking-wide text-slate-500">Uploaded documents</p>
+                {normalizeClaimDocuments(selected).length === 0 ? (
+                  <p className="text-[11px] text-slate-500">No documents uploaded.</p>
+                ) : (
+                  <ul className="space-y-1.5">
+                    {normalizeClaimDocuments(selected).map((doc, idx) => (
+                      <li
+                        key={`${selected._id}-d-${idx}`}
+                        className="flex items-center justify-between gap-2 text-[11px]"
+                      >
+                        <span className="truncate text-slate-300" title={doc.originalName}>
+                          {doc.originalName}
+                        </span>
+                        {doc.canDownload ? (
+                          <button
+                            type="button"
+                            onClick={() => downloadClaimDocument(selected._id, idx, doc.originalName)}
+                            className="shrink-0 text-amber-300 hover:text-amber-200 underline"
+                          >
+                            Download
+                          </button>
+                        ) : (
+                          <span className="shrink-0 text-slate-500">No file</span>
+                        )}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
               <div className="space-y-2 pt-2 border-t border-slate-800">
                 <label className="block text-xs text-slate-300 mb-1">
                   Status
@@ -926,87 +1087,6 @@ function AdminDashboard() {
           ) : (
             <p className="text-xs text-slate-500">
               Select a claim from the list to review details and update its status.
-            </p>
-          )}
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function AdminChatLogs() {
-  const [logs, setLogs] = useState([])
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-
-  const loadLogs = async () => {
-    setLoading(true)
-    setError('')
-    try {
-      const { data } = await adminApi.get('/admin/chatlogs')
-      setLogs(data)
-    } catch (err) {
-      setError(err.response?.data?.message || 'Failed to load chat logs')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    loadLogs()
-  }, [])
-
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <h2 className="text-lg font-semibold">Chatbot Conversations</h2>
-          <p className="text-xs text-slate-400">
-            Recent user and bot messages to help you improve responses.
-          </p>
-        </div>
-        <button
-          onClick={loadLogs}
-          disabled={loading}
-          className="inline-flex items-center justify-center rounded-md bg-slate-800 hover:bg-slate-700 text-xs md:text-sm px-3 py-1.5 border border-slate-700 hover:border-amber-400 disabled:opacity-60"
-        >
-          {loading ? 'Refreshing...' : 'Refresh'}
-        </button>
-      </div>
-      {error && (
-        <div className="text-sm text-red-400 bg-red-950/40 border border-red-900 px-3 py-2 rounded">
-          {error}
-        </div>
-      )}
-      <div className="bg-slate-900/70 border border-slate-800 rounded-xl shadow-lg shadow-slate-900/40 max-h-[460px] overflow-auto">
-        <div className="border-b border-slate-800 px-4 py-2">
-          <p className="text-xs font-medium text-slate-300 uppercase tracking-wide">
-            Latest messages ({logs.length})
-          </p>
-        </div>
-        <div className="divide-y divide-slate-800">
-          {logs.map((m) => (
-            <div key={m._id} className="px-4 py-2.5 flex items-start gap-3">
-              <span
-                className={`mt-0.5 inline-flex items-center justify-center rounded-full px-2.5 py-0.5 text-[10px] font-semibold ${
-                  m.sender === 'user'
-                    ? 'bg-sky-500/20 text-sky-300 border border-sky-500/40'
-                    : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                }`}
-              >
-                {m.sender === 'user' ? 'User' : 'Bot'}
-              </span>
-              <div className="flex-1">
-                <p className="text-xs text-slate-100">{m.message}</p>
-                <p className="text-[10px] text-slate-500 mt-1">
-                  User ID: {m.userId} • {new Date(m.createdAt).toLocaleString()}
-                </p>
-              </div>
-            </div>
-          ))}
-          {logs.length === 0 && !loading && (
-            <p className="text-xs text-slate-500 px-4 py-6 text-center">
-              No chat logs available yet.
             </p>
           )}
         </div>

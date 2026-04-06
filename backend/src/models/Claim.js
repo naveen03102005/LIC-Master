@@ -6,7 +6,8 @@ const claimSchema = new mongoose.Schema(
     policyholderName: { type: String, required: true },
     claimType: { type: String, required: true },
     reason: { type: String, required: true },
-    documents: [{ type: String }],
+    /** Legacy claims may still have plain string filenames (no file on disk). */
+    documents: { type: [mongoose.Schema.Types.Mixed], default: [] },
     status: {
       type: String,
       enum: ['Pending', 'Approved', 'Rejected'],

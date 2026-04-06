@@ -65,6 +65,9 @@ web_modules/
 # Yarn Integrity file
 .yarn-integrity
 
+# Uploaded claim documents (local dev)
+uploads/
+
 # dotenv environment variable files
 .env
 .env.*

@@ -1,7 +1,24 @@
 const express = require('express');
+const path = require('path');
+const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const Claim = require('../models/Claim');
 const ChatMessage = require('../models/ChatMessage');
+
+const uploadsRoot = path.resolve(__dirname, '../../uploads');
+
+function normalizeClaimDocumentEntry(doc, index) {
+  if (typeof doc === 'string') {
+    return { originalName: doc, storedPath: '' };
+  }
+  if (doc && typeof doc === 'object') {
+    return {
+      originalName: doc.originalName || `Document ${index + 1}`,
+      storedPath: doc.storedPath || '',
+    };
+  }
+  return { originalName: `Document ${index + 1}`, storedPath: '' };
+}
 
 const router = express.Router();
 
@@ -45,6 +62,37 @@ router.get('/claims', adminAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Failed to fetch claims' });
+  }
+});
+
+// Download uploaded document for a claim (admin only)
+router.get('/claims/:id/files/:index', adminAuth, async (req, res) => {
+  try {
+    const claim = await Claim.findById(req.params.id);
+    if (!claim) {
+      return res.status(404).json({ message: 'Claim not found' });
+    }
+    const index = parseInt(req.params.index, 10);
+    if (Number.isNaN(index) || index < 0) {
+      return res.status(400).json({ message: 'Invalid file index' });
+    }
+    const raw = claim.documents[index];
+    const { originalName, storedPath } = normalizeClaimDocumentEntry(raw, index);
+    if (!storedPath) {
+      return res.status(404).json({ message: 'No file stored for this document (legacy entry)' });
+    }
+    const absolute = path.resolve(uploadsRoot, storedPath);
+    const relativeToUploads = path.relative(uploadsRoot, absolute);
+    if (relativeToUploads.startsWith('..') || path.isAbsolute(relativeToUploads)) {
+      return res.status(400).json({ message: 'Invalid file path' });
+    }
+    if (!fs.existsSync(absolute)) {
+      return res.status(404).json({ message: 'File not found on server' });
+    }
+    res.download(absolute, originalName);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Failed to download file' });
   }
 });
 

@@ -1,12 +1,30 @@
 const express = require('express');
+const path = require('path');
+const fs = require('fs');
 const multer = require('multer');
 const Claim = require('../models/Claim');
 const authMiddleware = require('../middleware/authMiddleware');
 
 const router = express.Router();
 
-// Simple in-memory storage for filenames (no actual files persisted here)
-const upload = multer({ storage: multer.memoryStorage() });
+const uploadDir = path.join(__dirname, '../../uploads/claims');
+
+function ensureUploadDir() {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    ensureUploadDir();
+    cb(null, uploadDir);
+  },
+  filename: (req, file, cb) => {
+    const base = (file.originalname || 'file').replace(/[^a-zA-Z0-9._-]/g, '_');
+    cb(null, `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${base}`);
+  },
+});
+
+const upload = multer({ storage });
 
 // Create new claim
 router.post('/', authMiddleware, upload.array('documents'), async (req, res) => {
@@ -17,7 +35,10 @@ router.post('/', authMiddleware, upload.array('documents'), async (req, res) => 
       return res.status(400).json({ message: 'Missing required fields' });
     }
 
-    const documents = (req.files || []).map((file) => file.originalname);
+    const documents = (req.files || []).map((file) => ({
+      originalName: file.originalname,
+      storedPath: path.join('claims', file.filename).replace(/\\/g, '/'),
+    }));
 
     const claim = await Claim.create({
       policyNumber,
@@ -62,4 +83,3 @@ router.get('/:id', authMiddleware, async (req, res) => {
 });
 
 module.exports = router;
-
